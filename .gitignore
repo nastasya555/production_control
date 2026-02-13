@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Byte-compiled / cache
+*.log
+
+# Python tooling
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Virtualenv
+pip-wheel-metadata/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid
+
+# Local env
+.env
+
+# Redis / Postgres / MinIO volumes (если появятся локально)
+data/
+
+

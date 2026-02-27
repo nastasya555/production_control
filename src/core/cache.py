@@ -6,6 +6,8 @@ import hashlib
 import json
 
 from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from src.core.config import settings
 
@@ -23,8 +25,17 @@ def get_redis() -> Redis:
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
 
 
+def _normalize(obj: Any) -> Any:
+    # Исключаем объекты, которые не должны влиять на ключ (сессии БД и т.п.)
+    if isinstance(obj, (AsyncSession, Session)):
+        return "<db-session>"
+    return obj
+
+
 def _make_cache_key(prefix: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
-    raw = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True, default=str)
+    norm_args = tuple(_normalize(a) for a in args)
+    norm_kwargs = {k: _normalize(v) for k, v in kwargs.items()}
+    raw = json.dumps({"args": norm_args, "kwargs": norm_kwargs}, sort_keys=True, default=str)
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return f"{prefix}:{digest}"
 

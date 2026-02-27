@@ -1,58 +1,104 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Sequence
+import logging
 
 from celery import shared_task
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-from src.core.config import settings
-from src.core.database import Base
 from src.data.models.product import Product
+from src.data.models.batch import Batch
+from src.tasks.base import DatabaseTask
 
 
-engine = create_async_engine(settings.database_url_async, echo=False, future=True)
-AsyncSessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
+logger = logging.getLogger(__name__)
+
+BATCH_SIZE = 100
 
 
-@shared_task(bind=True, max_retries=3)
+@shared_task(bind=True, base=DatabaseTask, max_retries=3)
 def aggregate_products_batch(self, batch_id: int, unique_codes: Sequence[str], user_id: int | None = None) -> dict:
     """
-    Асинхронная массовая агрегация продукции.
+    Массовая агрегация продукции (синхронная задача Celery).
     """
+    session: Session = self.get_session()  # type: ignore[attr-defined]
 
-    async def _run() -> dict:
-        async with AsyncSessionLocal() as session:
-            from src.domain.services.batch_service import BatchService
+    try:
+        batch = session.get(Batch, batch_id)
+        if batch is None:
+            raise ValueError("Batch not found")
 
-            service = BatchService(session)
-            total = len(unique_codes)
-            aggregated = 0
-            errors: list[dict] = []
+        total = len(unique_codes)
+        aggregated = 0
+        errors: list[dict] = []
 
-            for idx, code in enumerate(unique_codes, start=1):
-                try:
-                    await service.aggregate_product(batch_id=batch_id, code=code)
-                    aggregated += 1
-                except Exception as exc:  # noqa: BLE001
-                    errors.append({"code": code, "reason": str(exc)})
+        for idx, code in enumerate(unique_codes, start=1):
+            try:
+                product = (
+                    session.query(Product)
+                    .filter(Product.batch_id == batch_id, Product.unique_code == code)
+                    .with_for_update(of=Product, nowait=False)
+                    .one_or_none()
+                )
 
-                if idx % 10 == 0 or idx == total:
-                    self.update_state(
-                        state="PROGRESS",
-                        meta={"current": idx, "total": total, "progress": round(idx / total * 100, 2)},
-                    )
+                if product is None:
+                    product = Product(batch_id=batch_id, unique_code=code)
+                    session.add(product)
 
-            return {
-                "success": len(errors) == 0,
-                "total": total,
-                "aggregated": aggregated,
-                "failed": len(errors),
-                "errors": errors,
-            }
+                if not product.is_aggregated:
+                    product.is_aggregated = True
+                    product.aggregated_at = datetime.utcnow()
 
-    import asyncio
+                aggregated += 1
 
-    return asyncio.run(_run())
+                if idx % BATCH_SIZE == 0:
+                    session.commit()
 
+            except IntegrityError as exc:
+                session.rollback()
+                logger.error(
+                    "Integrity error aggregating product",
+                    exc_info=True,
+                    extra={"batch_id": batch_id, "code": code},
+                )
+                errors.append(
+                    {
+                        "code": code,
+                        "error_type": exc.__class__.__name__,
+                        "reason": "duplicate or concurrent update",
+                    }
+                )
+            except Exception as exc:
+                session.rollback()
+                logger.critical(
+                    "Unexpected error in aggregate_products_batch",
+                    exc_info=True,
+                    extra={"batch_id": batch_id, "code": code},
+                )
+                raise
 
+            if idx % 10 == 0 or idx == total:
+                self.update_state(
+                    state="PROGRESS",
+                    meta={
+                        "current": idx,
+                        "total": total,
+                        "progress": round(idx / total * 100, 2),
+                    },
+                )
+
+        # финальный commit, если остались незафиксированные изменения
+        session.commit()
+
+        return {
+            "success": len(errors) == 0,
+            "total": total,
+            "aggregated": aggregated,
+            "failed": len(errors),
+            "errors": errors,
+        }
+    finally:
+        session.close()
 

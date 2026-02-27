@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import List, Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 from sqlalchemy import select
@@ -13,11 +13,22 @@ from src.api.v1.schemas.files import BatchReportRequest, BatchExportRequest
 from src.core.database import get_db
 from src.data.models.batch import Batch
 from src.domain.services.batch_service import BatchService
+from src.domain.uow import UnitOfWork
+from src.domain.events.event_dispatcher import EventDispatcher
 from src.tasks.aggregation import aggregate_products_batch
 from src.tasks.reports import generate_batch_report
 from src.tasks.imports import import_batches_from_file
 from src.tasks.exports import export_batches_to_file
 from src.storage.minio_service import MinIOService
+from src.core.config import settings
+from src.api.v1.dependencies import CurrentUser
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi import _rate_limit_exceeded_handler
+
+
+limiter = Limiter(key_func=get_remote_address)
 
 
 router = APIRouter(prefix="/batches", tags=["batches"])
@@ -27,9 +38,25 @@ router = APIRouter(prefix="/batches", tags=["batches"])
 async def create_batches(
     items: Sequence[BatchCreateItem],
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(),
 ) -> dict:
-    service = BatchService(db)
-    created = await service.create_batches([item.model_dump() for item in items])
+    async with UnitOfWork(db) as uow:
+        service = BatchService(uow.session)
+        created = await service.create_batches([item.model_dump() for item in items])
+        await uow.commit()
+
+    # события после успешного commit
+    dispatcher = EventDispatcher(db)
+    for b in created:
+        await dispatcher.dispatch(
+            "batch_created",
+            {
+                "id": b.id,
+                "batch_number": b.batch_number,
+                "batch_date": b.batch_date.isoformat(),
+                "nomenclature": b.nomenclature,
+            },
+        )
     return {"created": [batch.id for batch in created]}
 
 
@@ -51,12 +78,21 @@ async def update_batch(
     batch_id: int,
     payload: BatchUpdate,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(),
 ) -> BatchRead:
     batch = await db.get(Batch, batch_id)
     if batch is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found")
-    service = BatchService(db)
-    updated = await service.update_batch_status(batch, **payload.model_dump(exclude_unset=True))
+    async with UnitOfWork(db) as uow:
+        service = BatchService(uow.session)
+        updated = await service.update_batch_status(batch, **payload.model_dump(exclude_unset=True))
+        await uow.commit()
+
+    dispatcher = EventDispatcher(db)
+    await dispatcher.dispatch(
+        "batch_updated",
+        {"id": updated.id, "batch_number": updated.batch_number},
+    )
     await db.refresh(updated)
     return updated
 
@@ -90,6 +126,7 @@ async def aggregate_batch_async(
     batch_id: int,
     body: dict,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(),
 ) -> dict:
     codes: list[str] = body.get("unique_codes") or []
     if not codes:
@@ -111,6 +148,7 @@ async def create_batch_report(
     batch_id: int,
     body: BatchReportRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(),
 ) -> dict:
     if await db.get(Batch, batch_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found")
@@ -119,8 +157,11 @@ async def create_batch_report(
 
 
 @router.post("/import", status_code=status.HTTP_202_ACCEPTED)
+@limiter.limit("5/minute")
 async def import_batches(
+    request: Request,
     file: UploadFile = File(...),
+    current_user: CurrentUser = Depends(),
 ) -> dict:
     storage = MinIOService()
     import tempfile
@@ -129,7 +170,16 @@ async def import_batches(
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, file.filename)
         with open(path, "wb") as f:
-            f.write(await file.read())
+            max_bytes = settings.max_upload_mb * 1024 * 1024
+            total = 0
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(status_code=413, detail="File too large")
+                f.write(chunk)
 
         file_url = storage.upload_file(bucket="imports", file_path=path, object_name=file.filename)
 
@@ -144,6 +194,7 @@ async def import_batches(
 @router.post("/export", status_code=status.HTTP_202_ACCEPTED)
 async def export_batches(
     body: BatchExportRequest,
+    current_user: CurrentUser = Depends(),
 ) -> dict:
     task = export_batches_to_file.delay(filters=body.filters, format=body.format)
     return {"task_id": task.id}
